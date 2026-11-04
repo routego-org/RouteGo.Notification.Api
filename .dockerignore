@@ -1,0 +1,13 @@
+**/bin/
+**/obj/
+**/.vs/
+**/*.user
+.git/
+.agents/
+.claude/
+Notification.Tests/
+specs/
+local/
+migrations/
+docker-compose.yml
+Dockerfile

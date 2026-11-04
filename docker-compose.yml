@@ -1,0 +1,81 @@
+# LOCAL DEVELOPMENT ONLY — nothing here touches a real AWS account.
+#   docker compose up -d                  # Postgres + migrations + LocalStack (queues, SES sender) + Notification
+#   docker compose up -d postgres migrate localstack   # dependencies only, then: dotnet run --project Notification
+#
+# The EC2 deployment uses its own compose block on routego-core (02-notification.md §8), not this file.
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: routego_notification
+      POSTGRES_USER: notification_user
+      POSTGRES_PASSWORD: notification_local   # local-only throwaway password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notification_user -d routego_notification"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Applies migrations/ once Postgres is up, then exits. Re-run any time: docker compose run --rm migrate
+  migrate:
+    image: postgres:17
+    command: ["bash", "/local/apply-migrations.sh"]
+    environment:
+      PGHOST: postgres
+      PGDATABASE: routego_notification
+      PGUSER: notification_user
+      PGPASSWORD: notification_local
+    volumes:
+      - ./migrations:/migrations:ro
+      - ./local/apply-migrations.sh:/local/apply-migrations.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  localstack:
+    image: localstack/localstack:4.4
+    environment:
+      SERVICES: sqs,ses,secretsmanager,scheduler,events
+      AWS_DEFAULT_REGION: ap-south-1
+    ports:
+      - "4566:4566"
+    volumes:
+      # Runs once LocalStack is ready: creates the queues + DLQs and verifies the sender.
+      - ./local/localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+    healthcheck:
+      # Healthy only after the init script has created the last queue.
+      test: ["CMD-SHELL", "awslocal sqs get-queue-url --queue-name notification-ses-events-q >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  notification:
+    build: .
+    image: routego/notification:local
+    ports:
+      - "5007:8080"
+    environment:
+      # Development: SecretResolver reads secrets from configuration (these env vars), never AWS.
+      ASPNETCORE_ENVIRONMENT: Development
+      # Every AWS SDK client goes to LocalStack instead of real AWS.
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      # AWS_REGION is seeded to ap-south-1 by Infrastructure/LocalEntryPoints.cs in Development.
+      # The database secret, under its fixed name (Infrastructure/Pgsql/DbSecret.cs), in the platform JSON shape.
+      routego/notification/db: '{"host":"postgres","port":5432,"database":"routego_notification","username":"notification_user","password":"notification_local","sslmode":"disable"}'
+      # The internal key the Portal presents in X-Internal-Key (Infrastructure/InternalKeySecret.cs). Local-only throwaway value.
+      routego/internal-key: local-internal-key
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
